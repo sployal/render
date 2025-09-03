@@ -10,7 +10,7 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Initialize Supabase
+// Initialize Supabase with service role key for admin operations
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY
@@ -73,19 +73,44 @@ const uploadImageToCloudinary = (buffer) => {
     });
 };
 
+// Helper function to get user info from auth.users
+const getUserInfo = (authUser) => {
+    if (!authUser) return null;
+    
+    const metadata = authUser.raw_user_meta_data || {};
+    return {
+        id: authUser.id,
+        email: authUser.email,
+        fullName: metadata.full_name || metadata.name || authUser.email.split('@')[0],
+        username: metadata.username || authUser.email.split('@')[0],
+        accountType: metadata.account_type || 'free'
+    };
+};
+
+// Helper function to create user avatar initials
+const createAvatarInitials = (fullName) => {
+    if (!fullName) return 'U';
+    return fullName.split(' ')
+        .map(name => name[0])
+        .join('')
+        .toUpperCase()
+        .substring(0, 2);
+};
+
 // Routes
 app.get('/', (req, res) => {
     res.json({ 
         message: 'Welcome to Flodaz Community API',
-        version: '1.0.0',
+        version: '2.0.0',
         status: 'running',
         endpoints: {
             health: 'GET /api/health',
             posts: 'GET /api/posts',
             createPost: 'POST /api/posts',
             uploadImages: 'POST /api/upload-images',
-            register: 'POST /api/auth/register',
-            login: 'POST /api/auth/login'
+            likePost: 'POST /api/posts/:id/like',
+            getComments: 'GET /api/comments/:postId',
+            createComment: 'POST /api/comments'
         }
     });
 });
@@ -134,106 +159,29 @@ app.post('/api/upload-images', upload.array('images', 5), async (req, res) => {
     }
 });
 
-// Auth routes
-app.post('/api/auth/register', async (req, res) => {
-    try {
-        const { email, username, fullName, password } = req.body;
-        
-        if (!email || !username || !fullName || !password) {
-            return res.status(400).json({ error: 'All fields are required' });
-        }
-
-        // Check if user exists in Supabase
-        const { data: existingUser } = await supabase
-            .from('users')
-            .select('id')
-            .or(`email.eq.${email},username.eq.${username}`)
-            .single();
-
-        if (existingUser) {
-            return res.status(400).json({ error: 'User already exists' });
-        }
-
-        // Create user in Supabase
-        const { data: newUser, error } = await supabase
-            .from('users')
-            .insert([{
-                email,
-                username,
-                full_name: fullName,
-                account_type: 'free',
-                created_at: new Date().toISOString()
-            }])
-            .select()
-            .single();
-
-        if (error) {
-            console.error('Supabase user creation error:', error);
-            return res.status(500).json({ error: 'Failed to create user' });
-        }
-
-        res.status(201).json({
-            message: 'User registered successfully',
-            user: {
-                id: newUser.id,
-                email: newUser.email,
-                username: newUser.username,
-                fullName: newUser.full_name,
-                accountType: newUser.account_type
-            }
-        });
-    } catch (error) {
-        console.error('Registration error:', error);
-        res.status(500).json({ error: 'Registration failed' });
-    }
-});
-
-app.post('/api/auth/login', async (req, res) => {
-    try {
-        const { email, password } = req.body;
-        
-        if (!email || !password) {
-            return res.status(400).json({ error: 'Email and password are required' });
-        }
-
-        // Find user in Supabase
-        const { data: user, error } = await supabase
-            .from('users')
-            .select('*')
-            .eq('email', email)
-            .single();
-
-        if (error || !user) {
-            return res.status(400).json({ error: 'Invalid credentials' });
-        }
-
-        res.json({
-            message: 'Login successful',
-            user: {
-                id: user.id,
-                email: user.email,
-                username: user.username,
-                fullName: user.full_name,
-                accountType: user.account_type
-            }
-        });
-    } catch (error) {
-        console.error('Login error:', error);
-        res.status(500).json({ error: 'Login failed' });
-    }
-});
-
-// Post routes
+// Get posts with user information from auth.users
 app.get('/api/posts', async (req, res) => {
     try {
         const { page = 1, limit = 10, type } = req.query;
         const offset = (page - 1) * limit;
         
+        // Build query to get posts with user info
         let query = supabase
             .from('posts')
             .select(`
-                *,
-                users(username, full_name)
+                id,
+                user_id,
+                type,
+                title,
+                content,
+                images,
+                tags,
+                recipe_data,
+                likes,
+                shares,
+                comment_count,
+                created_at,
+                updated_at
             `)
             .order('created_at', { ascending: false });
         
@@ -249,27 +197,53 @@ app.get('/api/posts', async (req, res) => {
             return res.status(500).json({ error: 'Failed to fetch posts' });
         }
 
-        // Transform data to match frontend expectations
-        const transformedPosts = posts.map(post => ({
-            id: post.id,
-            type: post.type,
-            title: post.title,
-            content: post.content,
-            images: post.images || [],
-            tags: post.tags || [],
-            likes: post.likes || 0,
-            comments: post.comment_count || 0,
-            shares: post.shares || 0,
-            liked: false, // Would need user session to determine this
-            bookmarked: false, // Would need user session to determine this
-            timestamp: new Date(post.created_at).toLocaleString(),
-            author: {
-                name: post.users?.full_name || 'Anonymous',
-                username: post.users?.username || 'anonymous',
-                avatar: post.users?.full_name ? post.users.full_name.split(' ').map(n => n[0]).join('').toUpperCase() : 'A'
-            },
-            recipe: post.recipe_data
-        }));
+        // Get user information for each post
+        const userIds = [...new Set(posts.map(post => post.user_id))];
+        const { data: users, error: usersError } = await supabase.auth.admin.listUsers({
+            filter: `id.in.(${userIds.join(',')})`
+        });
+
+        if (usersError) {
+            console.error('Error fetching user data:', usersError);
+        }
+
+        // Create user lookup map
+        const userMap = {};
+        if (users && users.users) {
+            users.users.forEach(user => {
+                userMap[user.id] = getUserInfo(user);
+            });
+        }
+
+        // Transform posts with user information
+        const transformedPosts = posts.map(post => {
+            const userInfo = userMap[post.user_id] || {
+                fullName: 'Anonymous',
+                username: 'anonymous',
+                email: 'unknown@example.com'
+            };
+
+            return {
+                id: post.id,
+                type: post.type,
+                title: post.title,
+                content: post.content,
+                images: post.images || [],
+                tags: post.tags || [],
+                likes: post.likes || 0,
+                comments: post.comment_count || 0,
+                shares: post.shares || 0,
+                liked: false, // Would need user session to determine this
+                bookmarked: false, // Would need user session to determine this
+                timestamp: new Date(post.created_at).toLocaleString(),
+                author: {
+                    name: userInfo.fullName,
+                    username: userInfo.username,
+                    avatar: createAvatarInitials(userInfo.fullName)
+                },
+                recipe: post.recipe_data
+            };
+        });
 
         res.json({
             posts: transformedPosts,
@@ -286,12 +260,17 @@ app.get('/api/posts', async (req, res) => {
     }
 });
 
+// Create new post
 app.post('/api/posts', async (req, res) => {
     try {
-        const { type, title, content, tags, images, recipe, userId = 1 } = req.body;
+        const { type, title, content, tags, images, recipe, userId } = req.body;
         
         if (!type || !title || !content) {
             return res.status(400).json({ error: 'Type, title, and content are required' });
+        }
+
+        if (!userId) {
+            return res.status(400).json({ error: 'User ID is required' });
         }
 
         const postData = {
@@ -300,7 +279,7 @@ app.post('/api/posts', async (req, res) => {
             content,
             tags: Array.isArray(tags) ? tags : (tags ? tags.split(',').map(t => t.trim()) : []),
             images: images || [],
-            user_id: userId,
+            user_id: userId, // This should be a UUID from auth.users
             likes: 0,
             shares: 0,
             comment_count: 0,
@@ -315,15 +294,20 @@ app.post('/api/posts', async (req, res) => {
         const { data: newPost, error } = await supabase
             .from('posts')
             .insert([postData])
-            .select(`
-                *,
-                users(username, full_name)
-            `)
+            .select()
             .single();
 
         if (error) {
             console.error('Supabase post creation error:', error);
             return res.status(500).json({ error: 'Failed to create post' });
+        }
+
+        // Get user info for the response
+        const { data: { user }, error: userError } = await supabase.auth.admin.getUserById(userId);
+        let userInfo = { fullName: 'Anonymous', username: 'anonymous' };
+        
+        if (!userError && user) {
+            userInfo = getUserInfo(user);
         }
 
         // Transform response to match frontend expectations
@@ -339,9 +323,9 @@ app.post('/api/posts', async (req, res) => {
             shares: 0,
             timestamp: 'Just now',
             author: {
-                name: newPost.users?.full_name || 'Anonymous',
-                username: newPost.users?.username || 'anonymous',
-                avatar: newPost.users?.full_name ? newPost.users.full_name.split(' ').map(n => n[0]).join('').toUpperCase() : 'A'
+                name: userInfo.fullName,
+                username: userInfo.username,
+                avatar: createAvatarInitials(userInfo.fullName)
             },
             recipe: newPost.recipe_data
         };
@@ -363,18 +347,48 @@ app.get('/api/posts/:id', async (req, res) => {
         
         const { data: post, error } = await supabase
             .from('posts')
-            .select(`
-                *,
-                users(username, full_name)
-            `)
+            .select('*')
             .eq('id', postId)
             .single();
         
         if (error || !post) {
             return res.status(404).json({ error: 'Post not found' });
         }
-        
-        res.json({ post });
+
+        // // Get user info
+        const getUserInfo = (authUser) => {
+            if (!authUser) return null;
+            
+            const metadata = authUser.raw_user_meta_data || {};
+            
+            // Get full name
+            const fullName = metadata.full_name || metadata.name || authUser.email.split('@')[0];
+            
+            // Extract first name for fallback
+            const firstName = fullName.split(' ')[0];
+            
+            // Priority: username > firstName > email prefix
+            let username;
+            if (metadata.username) {
+                username = metadata.username;  // Use set username if available
+            } else if (firstName && firstName !== authUser.email.split('@')[0]) {
+                username = firstName;  // Use first name if it's not just the email prefix
+            } else {
+                username = authUser.email.split('@')[0];  // Final fallback to email prefix
+            }
+            
+            return {
+                id: authUser.id,
+                email: authUser.email,
+                fullName: fullName,
+                username: username,
+                accountType: metadata.account_type || 'free'
+            };
+        };
+
+
+
+        res.json({ post: transformedPost });
     } catch (error) {
         console.error('Get post error:', error);
         res.status(500).json({ error: 'Failed to fetch post' });
@@ -421,17 +435,14 @@ app.post('/api/posts/:id/like', async (req, res) => {
     }
 });
 
-// Comment routes
+// Get comments for a post
 app.get('/api/comments/:postId', async (req, res) => {
     try {
         const postId = parseInt(req.params.postId);
         
         const { data: comments, error } = await supabase
             .from('comments')
-            .select(`
-                *,
-                users(username, full_name)
-            `)
+            .select('*')
             .eq('post_id', postId)
             .order('created_at', { ascending: false });
 
@@ -440,16 +451,37 @@ app.get('/api/comments/:postId', async (req, res) => {
             return res.status(500).json({ error: 'Failed to fetch comments' });
         }
 
-        const transformedComments = comments.map(comment => ({
-            id: comment.id,
-            content: comment.content,
-            timestamp: new Date(comment.created_at).toLocaleString(),
-            author: {
-                name: comment.users?.full_name || 'Anonymous',
-                username: comment.users?.username || 'anonymous',
-                avatar: comment.users?.full_name ? comment.users.full_name.split(' ').map(n => n[0]).join('').toUpperCase() : 'A'
-            }
-        }));
+        // Get user information for each comment
+        const userIds = [...new Set(comments.map(comment => comment.user_id))];
+        const { data: users, error: usersError } = await supabase.auth.admin.listUsers({
+            filter: `id.in.(${userIds.join(',')})`
+        });
+
+        // Create user lookup map
+        const userMap = {};
+        if (users && users.users && !usersError) {
+            users.users.forEach(user => {
+                userMap[user.id] = getUserInfo(user);
+            });
+        }
+
+        const transformedComments = comments.map(comment => {
+            const userInfo = userMap[comment.user_id] || {
+                fullName: 'Anonymous',
+                username: 'anonymous'
+            };
+
+            return {
+                id: comment.id,
+                content: comment.content,
+                timestamp: new Date(comment.created_at).toLocaleString(),
+                author: {
+                    name: userInfo.fullName,
+                    username: userInfo.username,
+                    avatar: createAvatarInitials(userInfo.fullName)
+                }
+            };
+        });
         
         res.json({ comments: transformedComments });
     } catch (error) {
@@ -458,12 +490,17 @@ app.get('/api/comments/:postId', async (req, res) => {
     }
 });
 
+// Create comment
 app.post('/api/comments', async (req, res) => {
     try {
-        const { postId, content, userId = 1 } = req.body;
+        const { postId, content, userId } = req.body;
         
         if (!postId || !content) {
             return res.status(400).json({ error: 'Post ID and content are required' });
+        }
+
+        if (!userId) {
+            return res.status(400).json({ error: 'User ID is required' });
         }
 
         // Create comment
@@ -471,14 +508,11 @@ app.post('/api/comments', async (req, res) => {
             .from('comments')
             .insert([{
                 post_id: parseInt(postId),
-                user_id: userId,
+                user_id: userId, // UUID from auth.users
                 content,
                 created_at: new Date().toISOString()
             }])
-            .select(`
-                *,
-                users(username, full_name)
-            `)
+            .select()
             .single();
 
         if (commentError) {
@@ -494,6 +528,14 @@ app.post('/api/comments', async (req, res) => {
             console.error('Comment count update error:', updateError);
         }
 
+        // Get user info for response
+        const { data: { user }, error: userError } = await supabase.auth.admin.getUserById(userId);
+        let userInfo = { fullName: 'Anonymous', username: 'anonymous' };
+        
+        if (!userError && user) {
+            userInfo = getUserInfo(user);
+        }
+
         res.status(201).json({
             message: 'Comment created successfully',
             comment: {
@@ -501,9 +543,9 @@ app.post('/api/comments', async (req, res) => {
                 content: newComment.content,
                 timestamp: 'Just now',
                 author: {
-                    name: newComment.users?.full_name || 'Anonymous',
-                    username: newComment.users?.username || 'anonymous',
-                    avatar: newComment.users?.full_name ? newComment.users.full_name.split(' ').map(n => n[0]).join('').toUpperCase() : 'A'
+                    name: userInfo.fullName,
+                    username: userInfo.username,
+                    avatar: createAvatarInitials(userInfo.fullName)
                 }
             }
         });
