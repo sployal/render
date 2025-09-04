@@ -73,19 +73,38 @@ const uploadImageToCloudinary = (buffer) => {
     });
 };
 
-// Helper function to get user info from auth.users
+// CORRECTED: Helper function to get user info with proper priority system
 const getUserInfo = (authUser) => {
     if (!authUser) return null;
     
-    const metadata = authUser.raw_user_meta_data || {};
+    // FIXED: Use user_metadata instead of raw_user_meta_data
+    const metadata = authUser.user_metadata || {};
+    
+    // Get full name
+    const fullName = metadata.full_name || metadata.name || authUser.email.split('@')[0];
+    
+    // Extract first name for fallback
+    const firstName = fullName.split(' ')[0];
+    
+    // Priority: username > firstName > email prefix
+    let username;
+    if (metadata.username && metadata.username !== authUser.email.split('@')[0]) {
+        username = metadata.username;  // This will now find 'Davie'
+    } else if (firstName && firstName !== authUser.email.split('@')[0]) {
+        username = firstName;  // This will find 'David'
+    } else {
+        username = authUser.email.split('@')[0];  // Final fallback
+    }
+    
     return {
         id: authUser.id,
         email: authUser.email,
-        fullName: metadata.full_name || metadata.name || authUser.email.split('@')[0],
-        username: metadata.username || authUser.email.split('@')[0],
+        fullName: fullName,
+        username: username,
         accountType: metadata.account_type || 'free'
     };
 };
+
 
 // Helper function to create user avatar initials
 const createAvatarInitials = (fullName) => {
@@ -107,6 +126,8 @@ app.get('/', (req, res) => {
             health: 'GET /api/health',
             posts: 'GET /api/posts',
             createPost: 'POST /api/posts',
+            getPost: 'GET /api/posts/:id',
+            getUserById: 'GET /api/users/:userId',
             uploadImages: 'POST /api/upload-images',
             likePost: 'POST /api/posts/:id/like',
             getComments: 'GET /api/comments/:postId',
@@ -133,6 +154,28 @@ app.get('/api/health', async (req, res) => {
             message: 'Server running, database connection not tested',
             database: 'Unknown'
         });
+    }
+});
+
+// NEW: Get user by ID endpoint
+app.get('/api/users/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        
+        const { data: { user }, error } = await supabase.auth.admin.getUserById(userId);
+        
+        if (error || !user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        const userInfo = getUserInfo(user);
+        
+        res.json({ 
+            user: userInfo 
+        });
+    } catch (error) {
+        console.error('Get user by ID error:', error);
+        res.status(500).json({ error: 'Failed to fetch user' });
     }
 });
 
@@ -355,38 +398,35 @@ app.get('/api/posts/:id', async (req, res) => {
             return res.status(404).json({ error: 'Post not found' });
         }
 
-        // // Get user info
-        const getUserInfo = (authUser) => {
-            if (!authUser) return null;
-            
-            const metadata = authUser.raw_user_meta_data || {};
-            
-            // Get full name
-            const fullName = metadata.full_name || metadata.name || authUser.email.split('@')[0];
-            
-            // Extract first name for fallback
-            const firstName = fullName.split(' ')[0];
-            
-            // Priority: username > firstName > email prefix
-            let username;
-            if (metadata.username) {
-                username = metadata.username;  // Use set username if available
-            } else if (firstName && firstName !== authUser.email.split('@')[0]) {
-                username = firstName;  // Use first name if it's not just the email prefix
-            } else {
-                username = authUser.email.split('@')[0];  // Final fallback to email prefix
-            }
-            
-            return {
-                id: authUser.id,
-                email: authUser.email,
-                fullName: fullName,
-                username: username,
-                accountType: metadata.account_type || 'free'
-            };
+        // Get user info for this post
+        const { data: { user }, error: userError } = await supabase.auth.admin.getUserById(post.user_id);
+        let userInfo = { fullName: 'Anonymous', username: 'anonymous' };
+        
+        if (!userError && user) {
+            userInfo = getUserInfo(user);
+        }
+
+        // Transform post with user information
+        const transformedPost = {
+            id: post.id,
+            type: post.type,
+            title: post.title,
+            content: post.content,
+            images: post.images || [],
+            tags: post.tags || [],
+            likes: post.likes || 0,
+            comments: post.comment_count || 0,
+            shares: post.shares || 0,
+            liked: false,
+            bookmarked: false,
+            timestamp: new Date(post.created_at).toLocaleString(),
+            author: {
+                name: userInfo.fullName,
+                username: userInfo.username,
+                avatar: createAvatarInitials(userInfo.fullName)
+            },
+            recipe: post.recipe_data
         };
-
-
 
         res.json({ post: transformedPost });
     } catch (error) {
